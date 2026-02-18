@@ -1,111 +1,83 @@
-/**
- * Main plugin entry point for Claude Code Context Syncer
- */
-
-import { Plugin } from 'obsidian';
-import { ClaudeContextSyncSettings, DEFAULT_SETTINGS } from './types';
+import { Plugin, Notice } from 'obsidian';
+import { SyncerSettings, DEFAULT_SETTINGS } from './types';
 import { ClaudeContextSyncSettingTab } from './settings';
 import { ContextSyncer } from './syncer';
-import { formatRelativeTime } from './utils';
+import { formatRelativeTime, getClaudeHome } from './utils';
+import { promises as fs } from 'fs';
 
 export default class ClaudeContextSyncPlugin extends Plugin {
-	settings: ClaudeContextSyncSettings;
+	settings: SyncerSettings;
 	syncer: ContextSyncer | null = null;
 	statusBarItem: HTMLElement;
 
 	async onload() {
-		console.log('Loading Claude Context Syncer plugin');
-
-		// Load settings
 		await this.loadSettings();
-
-		// Add settings tab
 		this.addSettingTab(new ClaudeContextSyncSettingTab(this.app, this));
-
-		// Create status bar item
 		this.statusBarItem = this.addStatusBarItem();
 		this.updateStatusBar();
 
-		// Initialize syncer
+		this.addCommand({
+			id: 'sync-claude-contexts',
+			name: 'Sync Claude contexts now',
+			callback: async () => {
+				if (!this.syncer) {
+					new Notice('Claude syncer not initialized');
+					return;
+				}
+				new Notice('Syncing Claude contexts...');
+				const results = await this.syncer.syncAll();
+				const successCount = results.filter(r => r.success).length;
+				new Notice(`Synced ${successCount} conversation(s)`);
+			},
+		});
+
 		await this.initializeSyncer();
 	}
 
 	async onunload() {
-		console.log('Unloading Claude Context Syncer plugin');
-
-		// Stop file watcher and cleanup
 		if (this.syncer) {
 			await this.syncer.stopWatching();
 		}
 	}
 
-	/**
-	 * Initialize the context syncer
-	 */
 	async initializeSyncer(): Promise<void> {
-		// Clean up existing syncer if any
 		if (this.syncer) {
 			await this.syncer.stopWatching();
 		}
 
-		// Only initialize if we have a valid Claude path
-		if (this.settings.claudeProjectsPath) {
-			this.syncer = new ContextSyncer(this);
-			await this.syncer.initialize();
-		} else {
-			console.log('Claude Context Syncer: No Claude projects path configured, skipping initialization');
-			this.updateStatusBar('Not configured');
-		}
-	}
-
-	/**
-	 * Update the status bar display
-	 * @param customStatus - Optional custom status message
-	 */
-	updateStatusBar(customStatus?: string): void {
-		if (!this.statusBarItem) {
+		// Verify ~/.claude exists
+		const claudeHome = getClaudeHome();
+		try {
+			await fs.access(claudeHome);
+		} catch {
+			this.updateStatusBar('~/.claude not found');
 			return;
 		}
 
+		this.syncer = new ContextSyncer(this);
+		await this.syncer.initialize();
+		this.updateStatusBar();
+	}
+
+	updateStatusBar(customStatus?: string): void {
+		if (!this.statusBarItem) return;
+
 		if (customStatus) {
-			// Custom status (e.g., "Syncing... 45/123")
 			this.statusBarItem.setText(`Claude: ${customStatus}`);
 			return;
 		}
 
-		if (!this.settings.claudeProjectsPath) {
-			// Not configured
-			this.statusBarItem.setText('Claude: Not configured');
-			this.statusBarItem.removeClass('claude-syncer-success');
-			this.statusBarItem.removeClass('claude-syncer-error');
-			return;
-		}
-
 		if (this.settings.lastSyncTime === 0) {
-			// Never synced
 			this.statusBarItem.setText('Claude: Ready');
-			this.statusBarItem.removeClass('claude-syncer-success');
-			this.statusBarItem.removeClass('claude-syncer-error');
-			return;
+		} else {
+			this.statusBarItem.setText(`Claude: ${formatRelativeTime(this.settings.lastSyncTime)}`);
 		}
-
-		// Show last sync time
-		const relativeTime = formatRelativeTime(this.settings.lastSyncTime);
-		this.statusBarItem.setText(`Claude: ${relativeTime}`);
-		this.statusBarItem.addClass('claude-syncer-success');
-		this.statusBarItem.removeClass('claude-syncer-error');
 	}
 
-	/**
-	 * Load plugin settings from disk
-	 */
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 	}
 
-	/**
-	 * Save plugin settings to disk
-	 */
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}

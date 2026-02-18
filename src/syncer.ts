@@ -1,8 +1,3 @@
-/**
- * File syncer for Claude Code Context Syncer
- * Handles file watching, debouncing, and synchronization logic
- */
-
 import * as chokidar from 'chokidar';
 import { FSWatcher } from 'chokidar';
 import * as path from 'path';
@@ -11,205 +6,188 @@ import { createReadStream } from 'fs';
 import { createInterface } from 'readline';
 import { Notice } from 'obsidian';
 import ClaudeContextSyncPlugin from './main';
-import { ClaudeMessage, SessionMetadata, SyncResult, PendingSync } from './types';
-import { parseClaudePath, getTargetPaths, ensureDirectory, expandHomePath, getErrorMessage } from './utils';
+import { ConversationEntry, SyncResult } from './types';
+import { getClaudeHome, decodeProjectDir, ensureDirectory, sanitizeFileName, getErrorMessage } from './utils';
+import { convertToMarkdown } from './converter';
 
 export class ContextSyncer {
 	private plugin: ClaudeContextSyncPlugin;
 	private watcher: FSWatcher | null = null;
-	private pendingSyncs: Map<string, PendingSync> = new Map();
+	private pendingSyncs: Map<string, NodeJS.Timeout> = new Map();
 	private syncInProgress: Set<string> = new Set();
 
 	constructor(plugin: ClaudeContextSyncPlugin) {
 		this.plugin = plugin;
 	}
 
-	/**
-	 * Initialize the syncer
-	 */
 	async initialize(): Promise<void> {
-		console.log('Claude Context Syncer: Initializing...');
+		const claudeHome = getClaudeHome();
 
-		// Start file watching if auto-sync is enabled
-		if (this.plugin.settings.enableAutoSync) {
+		try {
+			await fs.access(claudeHome);
+		} catch {
+			new Notice('Claude Context Syncer: ~/.claude not found');
+			console.warn('Claude Context Syncer: ~/.claude does not exist');
+			return;
+		}
+
+		if (this.plugin.settings.autoSync) {
 			await this.startWatching();
 		}
 
-		// Run initial sync if enabled
 		if (this.plugin.settings.syncOnStartup) {
-			console.log('Claude Context Syncer: Running initial sync...');
-			// Run initial sync in background to not block plugin loading
-			setTimeout(() => this.syncAllExisting(), 1000);
+			setTimeout(() => this.syncAll(), 1000);
 		}
 	}
 
-	/**
-	 * Start watching the Claude projects directory for file changes
-	 */
 	async startWatching(): Promise<void> {
-		if (this.watcher) {
-			console.log('Claude Context Syncer: Watcher already running');
-			return;
-		}
+		if (this.watcher) return;
 
-		const claudePath = expandHomePath(this.plugin.settings.claudeProjectsPath);
-
-		if (!claudePath) {
-			console.warn('Claude Context Syncer: No Claude projects path configured');
-			return;
-		}
+		const claudeHome = getClaudeHome();
+		const projectsDir = path.join(claudeHome, 'projects');
 
 		try {
-			// Verify path exists before watching
-			await fs.access(claudePath);
-
-			const watchPattern = path.join(claudePath, '**/*.jsonl');
-			console.log(`Claude Context Syncer: Starting file watcher on ${watchPattern}`);
-
-			this.watcher = chokidar.watch(watchPattern, {
-				persistent: true,
-				ignoreInitial: true,  // Don't fire events for existing files
-				awaitWriteFinish: {
-					stabilityThreshold: 500,  // Wait 500ms of no changes
-					pollInterval: 100         // Check every 100ms
-				},
-				depth: 2,  // projects/{encoded}/{sessionId}.jsonl
-				followSymlinks: true,
-				alwaysStat: true
-			});
-
-			this.watcher
-				.on('add', (filePath) => {
-					console.log(`Claude Context Syncer: File added - ${filePath}`);
-					this.scheduleSyncWithDebounce(filePath);
-				})
-				.on('change', (filePath) => {
-					console.log(`Claude Context Syncer: File changed - ${filePath}`);
-					this.scheduleSyncWithDebounce(filePath);
-				})
-				.on('error', (error) => {
-					console.error('Claude Context Syncer: Watcher error', error);
-					this.handleWatchError(error);
-				})
-				.on('ready', () => {
-					console.log('Claude Context Syncer: File watcher ready');
-				});
-
-		} catch (error) {
-			console.error('Claude Context Syncer: Failed to start watcher', error);
-			new Notice(`Failed to start watching Claude directory: ${getErrorMessage(error)}`);
+			await fs.access(projectsDir);
+		} catch {
+			console.warn('Claude Context Syncer: ~/.claude/projects not found');
+			return;
 		}
+
+		const watchPaths = [
+			path.join(projectsDir, '**/*.jsonl'),
+			path.join(projectsDir, '**/memory/*'),
+			path.join(claudeHome, 'settings.json'),
+			path.join(claudeHome, 'plans', '*.md'),
+		];
+
+		this.watcher = chokidar.watch(watchPaths, {
+			persistent: true,
+			ignoreInitial: true,
+			awaitWriteFinish: {
+				stabilityThreshold: 500,
+				pollInterval: 100,
+			},
+			followSymlinks: true,
+		});
+
+		this.watcher
+			.on('add', (filePath) => this.scheduleSync(filePath))
+			.on('change', (filePath) => this.scheduleSync(filePath))
+			.on('error', (error) => {
+				console.error('Claude Context Syncer: Watcher error', error);
+				setTimeout(async () => {
+					await this.stopWatching();
+					await this.startWatching();
+				}, 5000);
+			});
 	}
 
-	/**
-	 * Stop watching for file changes
-	 */
 	async stopWatching(): Promise<void> {
 		if (this.watcher) {
-			console.log('Claude Context Syncer: Stopping file watcher');
 			await this.watcher.close();
 			this.watcher = null;
 		}
-
-		// Cancel all pending syncs
-		for (const [_, pending] of this.pendingSyncs) {
-			clearTimeout(pending.timeoutId);
+		for (const timeout of this.pendingSyncs.values()) {
+			clearTimeout(timeout);
 		}
 		this.pendingSyncs.clear();
 	}
 
-	/**
-	 * Schedule a sync with debouncing
-	 * @param filePath - Path to the file that changed
-	 */
-	private scheduleSyncWithDebounce(filePath: string): void {
-		// Cancel existing debounce for this file
-		if (this.pendingSyncs.has(filePath)) {
-			const existing = this.pendingSyncs.get(filePath)!;
-			clearTimeout(existing.timeoutId);
-		}
+	private scheduleSync(filePath: string): void {
+		const existing = this.pendingSyncs.get(filePath);
+		if (existing) clearTimeout(existing);
 
-		// Schedule new sync after 1 second
-		const timeoutId = setTimeout(() => {
+		const timeout = setTimeout(() => {
 			this.pendingSyncs.delete(filePath);
-			this.executeSync(filePath);
+			this.syncFile(filePath);
 		}, 1000);
 
-		this.pendingSyncs.set(filePath, {
-			filePath,
-			scheduledTime: Date.now() + 1000,
-			timeoutId
-		});
+		this.pendingSyncs.set(filePath, timeout);
 	}
 
 	/**
-	 * Execute the sync for a single file
-	 * @param filePath - Path to sync
+	 * Sync all Claude content to the vault.
 	 */
-	private async executeSync(filePath: string): Promise<void> {
-		try {
-			const result = await this.syncSingleFile(filePath);
-
-			if (result.success) {
-				console.log(`Claude Context Syncer: ${result.action} - ${result.projectName}/${result.sessionId}`);
-			} else {
-				console.error(`Claude Context Syncer: Sync failed - ${result.message}`, result.error);
-			}
-
-			// Update status bar
-			this.plugin.updateStatusBar();
-		} catch (error) {
-			console.error(`Claude Context Syncer: Unexpected error syncing ${filePath}`, error);
-		}
-	}
-
-	/**
-	 * Sync all existing conversations in the Claude directory
-	 * @returns Array of sync results
-	 */
-	async syncAllExisting(): Promise<SyncResult[]> {
+	async syncAll(): Promise<SyncResult[]> {
 		const results: SyncResult[] = [];
-		const claudePath = expandHomePath(this.plugin.settings.claudeProjectsPath);
-
-		if (!claudePath) {
-			new Notice('Claude projects path not configured');
-			return results;
-		}
+		const claudeHome = getClaudeHome();
+		const projectsDir = path.join(claudeHome, 'projects');
 
 		try {
-			// Find all .jsonl files
-			const files = await this.findAllJsonlFiles(claudePath);
+			// Sync conversations
+			const projectDirs = await this.listDirectories(projectsDir);
+			let totalFiles = 0;
+			const filesByProject: Map<string, string[]> = new Map();
 
-			if (files.length === 0) {
-				new Notice('No Claude conversations found to sync');
-				return results;
+			for (const dir of projectDirs) {
+				const dirPath = path.join(projectsDir, dir);
+				const files = await this.listFiles(dirPath, '.jsonl');
+				if (files.length > 0) {
+					filesByProject.set(dir, files.map(f => path.join(dirPath, f)));
+					totalFiles += files.length;
+				}
 			}
 
-			console.log(`Claude Context Syncer: Found ${files.length} conversation(s) to sync`);
-			this.plugin.updateStatusBar(`Syncing... 0/${files.length}`);
+			if (totalFiles > 0) {
+				this.plugin.updateStatusBar(`Syncing... 0/${totalFiles}`);
+				let synced = 0;
 
-			// Sync in batches of 10
-			const batchSize = 10;
-			for (let i = 0; i < files.length; i += batchSize) {
-				const batch = files.slice(i, i + batchSize);
-				const batchResults = await Promise.all(
-					batch.map(f => this.syncSingleFile(f))
-				);
-				results.push(...batchResults);
-
-				// Update progress
-				const progress = Math.min(i + batch.length, files.length);
-				this.plugin.updateStatusBar(`Syncing... ${progress}/${files.length}`);
+				for (const [, files] of filesByProject) {
+					for (const filePath of files) {
+						const result = await this.syncFile(filePath);
+						results.push(result);
+						synced++;
+						this.plugin.updateStatusBar(`Syncing... ${synced}/${totalFiles}`);
+					}
+				}
 			}
 
-			// Update final status
+			// Sync memory directories
+			for (const dir of projectDirs) {
+				const memoryDir = path.join(projectsDir, dir, 'memory');
+				try {
+					const memoryFiles = await fs.readdir(memoryDir);
+					for (const file of memoryFiles) {
+						await this.syncMemoryFile(
+							path.join(memoryDir, file),
+							dir
+						);
+					}
+				} catch {
+					// No memory dir for this project, skip
+				}
+			}
+
+			// Sync settings.json
+			await this.syncSimpleFile(
+				path.join(claudeHome, 'settings.json'),
+				'settings.json'
+			);
+
+			// Sync plans
+			const plansDir = path.join(claudeHome, 'plans');
+			try {
+				const planFiles = await this.listFiles(plansDir, '.md');
+				for (const file of planFiles) {
+					await this.syncSimpleFile(
+						path.join(plansDir, file),
+						path.join('Plans', file)
+					);
+				}
+			} catch {
+				// No plans dir, skip
+			}
+
+			// Update status
+			this.plugin.settings.lastSyncTime = Date.now();
+			await this.plugin.saveSettings();
 			this.plugin.updateStatusBar();
 
 			const successCount = results.filter(r => r.success).length;
-			console.log(`Claude Context Syncer: Sync complete - ${successCount}/${files.length} succeeded`);
+			console.log(`Claude Context Syncer: Sync complete — ${successCount}/${results.length} conversations synced`);
 
 		} catch (error) {
-			console.error('Claude Context Syncer: Error during full sync', error);
+			console.error('Claude Context Syncer: Sync error', error);
 			new Notice(`Sync error: ${getErrorMessage(error)}`);
 		}
 
@@ -217,258 +195,198 @@ export class ContextSyncer {
 	}
 
 	/**
-	 * Sync a single JSONL file to the vault
-	 * @param filePath - Path to the .jsonl file
-	 * @returns Sync result
+	 * Sync a single JSONL conversation file: copy raw + convert to Markdown.
 	 */
-	async syncSingleFile(filePath: string): Promise<SyncResult> {
-		// Check if sync already in progress for this file
+	private async syncFile(filePath: string): Promise<SyncResult> {
 		if (this.syncInProgress.has(filePath)) {
-			return {
-				success: false,
-				sessionId: '',
-				projectName: '',
-				action: 'skipped',
-				message: 'Sync already in progress'
-			};
+			return { success: false, project: '', file: '', action: 'skipped', error: 'Already syncing' };
 		}
-
 		this.syncInProgress.add(filePath);
 
 		try {
-			// Parse the Claude path
-			const parsedPath = parseClaudePath(filePath);
+			// Determine project name from parent directory
+			const parentDir = path.basename(path.dirname(filePath));
 
-			// Get target paths in Obsidian vault
-			const targetPaths = getTargetPaths(
-				this.plugin.app.vault,
-				this.plugin.settings.obsidianStoragePath,
-				parsedPath
-			);
+			// Check if this is a conversation JSONL
+			if (!filePath.endsWith('.jsonl')) {
+				return { success: true, project: parentDir, file: path.basename(filePath), action: 'skipped' };
+			}
 
-			// Check if sync is needed
-			const shouldSync = await this.shouldSync(filePath, targetPaths.metaFile);
+			const projectName = decodeProjectDir(parentDir);
+			const sanitizedProject = sanitizeFileName(projectName);
+			const vaultBase = this.getVaultBasePath();
+			const destDir = path.join(vaultBase, this.plugin.settings.vaultFolder, 'Conversations', sanitizedProject);
 
+			// Check mtime — skip if destination is up to date
+			const shouldSync = await this.needsSync(filePath, destDir, path.basename(filePath));
 			if (!shouldSync) {
-				return {
-					success: true,
-					sessionId: parsedPath.sessionId,
-					projectName: parsedPath.decodedProjectName,
-					action: 'skipped',
-					message: 'Already up to date'
-				};
+				return { success: true, project: projectName, file: path.basename(filePath), action: 'skipped' };
 			}
 
-			// Parse JSONL file
-			const messages = await this.parseJsonlFile(filePath);
+			await ensureDirectory(destDir);
 
-			if (messages.length === 0) {
-				return {
-					success: false,
-					sessionId: parsedPath.sessionId,
-					projectName: parsedPath.decodedProjectName,
-					action: 'skipped',
-					message: 'Empty JSONL file'
-				};
+			// Parse JSONL
+			const entries = await this.parseJsonl(filePath);
+			if (entries.length === 0) {
+				return { success: false, project: projectName, file: path.basename(filePath), action: 'skipped', error: 'Empty file' };
 			}
 
-			// Generate metadata
-			const metadata = await this.generateMetadata(messages, filePath, parsedPath);
+			// Copy raw JSONL
+			const rawContent = await fs.readFile(filePath, 'utf-8');
+			const rawDest = path.join(destDir, path.basename(filePath));
+			await fs.writeFile(rawDest, rawContent, 'utf-8');
 
-			// Ensure target directory exists
-			await ensureDirectory(targetPaths.projectDir);
+			// Convert to Markdown
+			const { markdown, title, datePrefix } = convertToMarkdown(entries);
+			const mdFileName = sanitizeFileName(`${datePrefix} ${title}`) + '.md';
+			const mdDest = path.join(destDir, mdFileName);
+			await fs.writeFile(mdDest, markdown, 'utf-8');
 
-			// Read the original file content to preserve it exactly
-			const originalContent = await fs.readFile(filePath, 'utf-8');
+			// Also rename the raw JSONL copy to match
+			const jsonlFileName = sanitizeFileName(`${datePrefix} ${title}`) + '.jsonl';
+			const jsonlDest = path.join(destDir, jsonlFileName);
+			if (jsonlDest !== rawDest) {
+				// Remove old UUID-named copy, write with friendly name
+				await fs.unlink(rawDest).catch(() => {});
+				await fs.writeFile(jsonlDest, rawContent, 'utf-8');
+			}
 
-			// Write JSONL file (original content)
-			await fs.writeFile(targetPaths.jsonlFile, originalContent, 'utf-8');
-
-			// Write metadata file
-			await fs.writeFile(
-				targetPaths.metaFile,
-				JSON.stringify(metadata, null, 2),
-				'utf-8'
-			);
-
-			// Update last sync time in settings
 			this.plugin.settings.lastSyncTime = Date.now();
-			await this.plugin.saveSettings();
 
-			return {
-				success: true,
-				sessionId: parsedPath.sessionId,
-				projectName: parsedPath.decodedProjectName,
-				action: targetPaths.jsonlFile ? 'updated' : 'created'
-			};
-
+			return { success: true, project: projectName, file: mdFileName, action: 'updated' };
 		} catch (error: any) {
-			return {
-				success: false,
-				sessionId: '',
-				projectName: '',
-				action: 'error',
-				message: getErrorMessage(error),
-				error
-			};
+			return { success: false, project: '', file: path.basename(filePath), action: 'error', error: getErrorMessage(error) };
 		} finally {
 			this.syncInProgress.delete(filePath);
 		}
 	}
 
 	/**
-	 * Check if a file should be synced based on timestamps
-	 * @param sourcePath - Path to source .jsonl file
-	 * @param metaFilePath - Path to metadata file in vault
-	 * @returns true if sync is needed
+	 * Sync a memory file (e.g. MEMORY.md) for a project.
 	 */
-	private async shouldSync(sourcePath: string, metaFilePath: string): Promise<boolean> {
+	private async syncMemoryFile(filePath: string, encodedProjectDir: string): Promise<void> {
 		try {
-			// Check if metadata file exists
-			await fs.access(metaFilePath);
+			const projectName = decodeProjectDir(encodedProjectDir);
+			const sanitizedProject = sanitizeFileName(projectName);
+			const vaultBase = this.getVaultBasePath();
+			const destDir = path.join(vaultBase, this.plugin.settings.vaultFolder, 'Conversations', sanitizedProject, 'memory');
 
-			// Read metadata
-			const metaContent = await fs.readFile(metaFilePath, 'utf-8');
-			const metadata: SessionMetadata = JSON.parse(metaContent);
+			const destFile = path.join(destDir, path.basename(filePath));
 
-			// Get source file stats
-			const sourceStats = await fs.stat(sourcePath);
-
-			// Compare modification times
-			// Sync if source is newer than when it was last synced
-			return sourceStats.mtimeMs > metadata.syncedAt;
-
-		} catch (error: any) {
-			if (error.code === 'ENOENT') {
-				// Metadata doesn't exist, need to sync
-				return true;
+			// Check mtime
+			const srcStat = await fs.stat(filePath);
+			try {
+				const destStat = await fs.stat(destFile);
+				if (destStat.mtimeMs >= srcStat.mtimeMs) return;
+			} catch {
+				// dest doesn't exist, proceed
 			}
-			// On any other error, try to sync anyway
+
+			await ensureDirectory(destDir);
+			const content = await fs.readFile(filePath, 'utf-8');
+			await fs.writeFile(destFile, content, 'utf-8');
+		} catch (error) {
+			console.warn(`Claude Context Syncer: Failed to sync memory file ${filePath}`, error);
+		}
+	}
+
+	/**
+	 * Sync a simple file (settings.json, plan .md files).
+	 */
+	private async syncSimpleFile(srcPath: string, relativeDest: string): Promise<void> {
+		try {
+			const srcStat = await fs.stat(srcPath);
+			const vaultBase = this.getVaultBasePath();
+			const destPath = path.join(vaultBase, this.plugin.settings.vaultFolder, relativeDest);
+
+			// Check mtime
+			try {
+				const destStat = await fs.stat(destPath);
+				if (destStat.mtimeMs >= srcStat.mtimeMs) return;
+			} catch {
+				// dest doesn't exist
+			}
+
+			await ensureDirectory(path.dirname(destPath));
+			const content = await fs.readFile(srcPath, 'utf-8');
+			await fs.writeFile(destPath, content, 'utf-8');
+		} catch (error) {
+			console.warn(`Claude Context Syncer: Failed to sync ${srcPath}`, error);
+		}
+	}
+
+	/**
+	 * Check if a conversation needs syncing by comparing source mtime
+	 * against any existing files in the destination directory.
+	 */
+	private async needsSync(srcPath: string, destDir: string, srcFileName: string): Promise<boolean> {
+		try {
+			const srcStat = await fs.stat(srcPath);
+
+			// Check if dest directory exists
+			try {
+				await fs.access(destDir);
+			} catch {
+				return true; // Dir doesn't exist, need to sync
+			}
+
+			// Look for any file derived from this source
+			// The JSONL filename is a UUID, and we create friendly-named copies.
+			// Check if any JSONL in destDir has same content by checking for
+			// a raw JSONL copy. We use a simple approach: check all .jsonl files in dest.
+			const destFiles = await fs.readdir(destDir);
+			const jsonlFiles = destFiles.filter(f => f.endsWith('.jsonl'));
+
+			if (jsonlFiles.length === 0) return true;
+
+			// Check if source is newer than the newest dest JSONL
+			for (const jf of jsonlFiles) {
+				const destStat = await fs.stat(path.join(destDir, jf));
+				if (destStat.mtimeMs >= srcStat.mtimeMs) return false;
+			}
+
+			return true;
+		} catch {
 			return true;
 		}
 	}
 
-	/**
-	 * Parse a JSONL file line by line
-	 * @param filePath - Path to .jsonl file
-	 * @returns Array of parsed messages
-	 */
-	private async parseJsonlFile(filePath: string): Promise<ClaudeMessage[]> {
-		const messages: ClaudeMessage[] = [];
+	private async parseJsonl(filePath: string): Promise<ConversationEntry[]> {
+		const entries: ConversationEntry[] = [];
+		const fileStream = createReadStream(filePath);
+		const rl = createInterface({ input: fileStream, crlfDelay: Infinity });
 
-		try {
-			const fileStream = createReadStream(filePath);
-			const rl = createInterface({
-				input: fileStream,
-				crlfDelay: Infinity
-			});
-
-			let lineNumber = 0;
-			for await (const line of rl) {
-				lineNumber++;
-
-				if (line.trim() === '') {
-					continue;  // Skip empty lines
-				}
-
-				try {
-					const message = JSON.parse(line) as ClaudeMessage;
-					messages.push(message);
-				} catch (error) {
-					console.warn(`Claude Context Syncer: Failed to parse line ${lineNumber} in ${filePath}:`, error);
-					// Continue parsing other lines
-				}
+		for await (const line of rl) {
+			if (!line.trim()) continue;
+			try {
+				entries.push(JSON.parse(line) as ConversationEntry);
+			} catch {
+				// Skip unparseable lines
 			}
-		} catch (error) {
-			console.error(`Claude Context Syncer: Error reading file ${filePath}`, error);
-			throw error;
 		}
 
-		return messages;
+		return entries;
 	}
 
-	/**
-	 * Generate metadata for a synced session
-	 * @param messages - Parsed messages from JSONL
-	 * @param sourcePath - Original file path
-	 * @param parsedPath - Parsed Claude path components
-	 * @returns Session metadata
-	 */
-	private async generateMetadata(
-		messages: ClaudeMessage[],
-		sourcePath: string,
-		parsedPath: ReturnType<typeof parseClaudePath>
-	): Promise<SessionMetadata> {
-		// Extract timestamps
-		const timestamps = messages
-			.map(m => m.timestamp)
-			.filter(t => t !== undefined && t !== null);
-
-		// Find git branch and version from messages
-		const gitBranch = messages.find(m => m.gitBranch)?.gitBranch;
-		const version = messages.find(m => m.version)?.version;
-
-		return {
-			sessionId: parsedPath.sessionId,
-			projectName: parsedPath.decodedProjectName,
-			projectPath: parsedPath.encodedProjectName,
-			messageCount: messages.length,
-			firstTimestamp: timestamps.length > 0 ? Math.min(...timestamps) : Date.now(),
-			lastTimestamp: timestamps.length > 0 ? Math.max(...timestamps) : Date.now(),
-			gitBranch,
-			version,
-			syncedAt: Date.now(),
-			sourceFilePath: sourcePath
-		};
-	}
-
-	/**
-	 * Find all .jsonl files in the Claude projects directory
-	 * @param claudePath - Path to .claude/projects
-	 * @returns Array of file paths
-	 */
-	private async findAllJsonlFiles(claudePath: string): Promise<string[]> {
-		const files: string[] = [];
-
+	private async listDirectories(dirPath: string): Promise<string[]> {
 		try {
-			const entries = await fs.readdir(claudePath, { withFileTypes: true });
-
-			for (const entry of entries) {
-				if (entry.isDirectory()) {
-					const projectDir = path.join(claudePath, entry.name);
-
-					try {
-						const projectFiles = await fs.readdir(projectDir);
-						const jsonlFiles = projectFiles
-							.filter(f => f.endsWith('.jsonl'))
-							.map(f => path.join(projectDir, f));
-
-						files.push(...jsonlFiles);
-					} catch (error) {
-						console.warn(`Claude Context Syncer: Could not read directory ${projectDir}`, error);
-					}
-				}
-			}
-		} catch (error) {
-			console.error(`Claude Context Syncer: Could not read Claude projects directory`, error);
-			throw error;
+			const entries = await fs.readdir(dirPath, { withFileTypes: true });
+			return entries.filter(e => e.isDirectory()).map(e => e.name);
+		} catch {
+			return [];
 		}
-
-		return files;
 	}
 
-	/**
-	 * Handle file watcher errors
-	 * @param error - Error from chokidar
-	 */
-	private handleWatchError(error: any): void {
-		console.error('Claude Context Syncer: File watcher error', error);
+	private async listFiles(dirPath: string, extension: string): Promise<string[]> {
+		try {
+			const entries = await fs.readdir(dirPath);
+			return entries.filter(f => f.endsWith(extension));
+		} catch {
+			return [];
+		}
+	}
 
-		// Attempt to restart watcher after 5 seconds
-		setTimeout(async () => {
-			console.log('Claude Context Syncer: Attempting to restart watcher...');
-			await this.stopWatching();
-			await this.startWatching();
-		}, 5000);
+	private getVaultBasePath(): string {
+		return (this.plugin.app.vault.adapter as any).basePath;
 	}
 }
