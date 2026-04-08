@@ -14,8 +14,6 @@ export class ClaudeContextSyncSettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 		containerEl.empty();
 
-		containerEl.createEl('h2', { text: 'Claude Context Syncer' });
-
 		new Setting(containerEl)
 			.setName('Vault folder')
 			.setDesc('Folder within your vault where Claude data will be synced')
@@ -41,6 +39,16 @@ export class ClaudeContextSyncSettingTab extends PluginSettingTab {
 					} else {
 						await this.plugin.syncer?.stopWatching();
 					}
+				}));
+
+		new Setting(containerEl)
+			.setName('Sync on startup')
+			.setDesc('Automatically sync all conversations when Obsidian starts')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.syncOnStartup)
+				.onChange(async (value) => {
+					this.plugin.settings.syncOnStartup = value;
+					await this.plugin.saveSettings();
 				}));
 
 		new Setting(containerEl)

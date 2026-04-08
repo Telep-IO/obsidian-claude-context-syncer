@@ -1,20 +1,7 @@
 import * as path from 'path';
 import * as os from 'os';
-import { promises as fs } from 'fs';
-
 export function getClaudeHome(): string {
 	return path.join(os.homedir(), '.claude');
-}
-
-export function expandHomePath(inputPath: string): string {
-	if (inputPath.startsWith('~/') || inputPath === '~') {
-		return path.join(os.homedir(), inputPath.slice(1));
-	}
-	return inputPath;
-}
-
-export async function ensureDirectory(dirPath: string): Promise<void> {
-	await fs.mkdir(dirPath, { recursive: true });
 }
 
 export function formatRelativeTime(timestamp: number): string {

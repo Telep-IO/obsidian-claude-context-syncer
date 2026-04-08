@@ -4,10 +4,10 @@ import * as path from 'path';
 import { promises as fs } from 'fs';
 import { createReadStream } from 'fs';
 import { createInterface } from 'readline';
-import { Notice } from 'obsidian';
+import { Notice, normalizePath } from 'obsidian';
 import ClaudeContextSyncPlugin from './main';
 import { ConversationEntry, SyncResult } from './types';
-import { getClaudeHome, decodeProjectDir, ensureDirectory, sanitizeFileName, getErrorMessage } from './utils';
+import { getClaudeHome, decodeProjectDir, sanitizeFileName, getErrorMessage } from './utils';
 import { convertToMarkdown } from './converter';
 
 export class ContextSyncer {
@@ -15,6 +15,7 @@ export class ContextSyncer {
 	private watcher: FSWatcher | null = null;
 	private pendingSyncs: Map<string, NodeJS.Timeout> = new Map();
 	private syncInProgress: Set<string> = new Set();
+	private restartingWatcher = false;
 
 	constructor(plugin: ClaudeContextSyncPlugin) {
 		this.plugin = plugin;
@@ -75,9 +76,12 @@ export class ContextSyncer {
 			.on('change', (filePath) => this.scheduleSync(filePath))
 			.on('error', (error) => {
 				console.error('Claude Context Syncer: Watcher error', error);
+				if (this.restartingWatcher) return;
+				this.restartingWatcher = true;
 				setTimeout(async () => {
 					await this.stopWatching();
 					await this.startWatching();
+					this.restartingWatcher = false;
 				}, 5000);
 			});
 	}
@@ -171,7 +175,7 @@ export class ContextSyncer {
 				for (const file of planFiles) {
 					await this.syncSimpleFile(
 						path.join(plansDir, file),
-						path.join('Plans', file)
+						`Plans/${file}`
 					);
 				}
 			} catch {
@@ -184,7 +188,7 @@ export class ContextSyncer {
 			this.plugin.updateStatusBar();
 
 			const successCount = results.filter(r => r.success).length;
-			console.log(`Claude Context Syncer: Sync complete — ${successCount}/${results.length} conversations synced`);
+			console.debug(`Claude Context Syncer: Sync complete — ${successCount}/${results.length} conversations synced`);
 
 		} catch (error) {
 			console.error('Claude Context Syncer: Sync error', error);
@@ -214,16 +218,15 @@ export class ContextSyncer {
 
 			const projectName = decodeProjectDir(parentDir);
 			const sanitizedProject = sanitizeFileName(projectName);
-			const vaultBase = this.getVaultBasePath();
-			const destDir = path.join(vaultBase, this.plugin.settings.vaultFolder, 'Conversations', sanitizedProject);
+			const destDir = normalizePath(`${this.plugin.settings.vaultFolder}/Conversations/${sanitizedProject}`);
 
 			// Check mtime — skip if destination is up to date
-			const shouldSync = await this.needsSync(filePath, destDir, path.basename(filePath));
+			const shouldSync = await this.needsSync(filePath, destDir);
 			if (!shouldSync) {
 				return { success: true, project: projectName, file: path.basename(filePath), action: 'skipped' };
 			}
 
-			await ensureDirectory(destDir);
+			await this.ensureVaultDir(destDir);
 
 			// Parse JSONL
 			const entries = await this.parseJsonl(filePath);
@@ -231,25 +234,18 @@ export class ContextSyncer {
 				return { success: false, project: projectName, file: path.basename(filePath), action: 'skipped', error: 'Empty file' };
 			}
 
-			// Copy raw JSONL
+			// Read raw content from source
 			const rawContent = await fs.readFile(filePath, 'utf-8');
-			const rawDest = path.join(destDir, path.basename(filePath));
-			await fs.writeFile(rawDest, rawContent, 'utf-8');
 
 			// Convert to Markdown
 			const { markdown, title, datePrefix } = convertToMarkdown(entries);
 			const mdFileName = sanitizeFileName(`${datePrefix} ${title}`) + '.md';
-			const mdDest = path.join(destDir, mdFileName);
-			await fs.writeFile(mdDest, markdown, 'utf-8');
-
-			// Also rename the raw JSONL copy to match
 			const jsonlFileName = sanitizeFileName(`${datePrefix} ${title}`) + '.jsonl';
-			const jsonlDest = path.join(destDir, jsonlFileName);
-			if (jsonlDest !== rawDest) {
-				// Remove old UUID-named copy, write with friendly name
-				await fs.unlink(rawDest).catch(() => {});
-				await fs.writeFile(jsonlDest, rawContent, 'utf-8');
-			}
+
+			// Write Markdown and JSONL to vault using Obsidian adapter
+			const adapter = this.plugin.app.vault.adapter;
+			await adapter.write(normalizePath(`${destDir}/${mdFileName}`), markdown);
+			await adapter.write(normalizePath(`${destDir}/${jsonlFileName}`), rawContent);
 
 			this.plugin.settings.lastSyncTime = Date.now();
 
@@ -268,23 +264,17 @@ export class ContextSyncer {
 		try {
 			const projectName = decodeProjectDir(encodedProjectDir);
 			const sanitizedProject = sanitizeFileName(projectName);
-			const vaultBase = this.getVaultBasePath();
-			const destDir = path.join(vaultBase, this.plugin.settings.vaultFolder, 'Conversations', sanitizedProject, 'memory');
-
-			const destFile = path.join(destDir, path.basename(filePath));
+			const destDir = normalizePath(`${this.plugin.settings.vaultFolder}/Conversations/${sanitizedProject}/memory`);
+			const destFile = normalizePath(`${destDir}/${path.basename(filePath)}`);
 
 			// Check mtime
 			const srcStat = await fs.stat(filePath);
-			try {
-				const destStat = await fs.stat(destFile);
-				if (destStat.mtimeMs >= srcStat.mtimeMs) return;
-			} catch {
-				// dest doesn't exist, proceed
-			}
+			const destStat = await this.plugin.app.vault.adapter.stat(destFile);
+			if (destStat && destStat.mtime >= srcStat.mtimeMs) return;
 
-			await ensureDirectory(destDir);
+			await this.ensureVaultDir(destDir);
 			const content = await fs.readFile(filePath, 'utf-8');
-			await fs.writeFile(destFile, content, 'utf-8');
+			await this.plugin.app.vault.adapter.write(destFile, content);
 		} catch (error) {
 			console.warn(`Claude Context Syncer: Failed to sync memory file ${filePath}`, error);
 		}
@@ -296,20 +286,20 @@ export class ContextSyncer {
 	private async syncSimpleFile(srcPath: string, relativeDest: string): Promise<void> {
 		try {
 			const srcStat = await fs.stat(srcPath);
-			const vaultBase = this.getVaultBasePath();
-			const destPath = path.join(vaultBase, this.plugin.settings.vaultFolder, relativeDest);
+			const destPath = normalizePath(`${this.plugin.settings.vaultFolder}/${relativeDest}`);
 
 			// Check mtime
-			try {
-				const destStat = await fs.stat(destPath);
-				if (destStat.mtimeMs >= srcStat.mtimeMs) return;
-			} catch {
-				// dest doesn't exist
+			const destStat = await this.plugin.app.vault.adapter.stat(destPath);
+			if (destStat && destStat.mtime >= srcStat.mtimeMs) return;
+
+			// Ensure parent directory exists
+			const parentDir = destPath.substring(0, destPath.lastIndexOf('/'));
+			if (parentDir) {
+				await this.ensureVaultDir(parentDir);
 			}
 
-			await ensureDirectory(path.dirname(destPath));
 			const content = await fs.readFile(srcPath, 'utf-8');
-			await fs.writeFile(destPath, content, 'utf-8');
+			await this.plugin.app.vault.adapter.write(destPath, content);
 		} catch (error) {
 			console.warn(`Claude Context Syncer: Failed to sync ${srcPath}`, error);
 		}
@@ -319,35 +309,50 @@ export class ContextSyncer {
 	 * Check if a conversation needs syncing by comparing source mtime
 	 * against any existing files in the destination directory.
 	 */
-	private async needsSync(srcPath: string, destDir: string, srcFileName: string): Promise<boolean> {
+	private async needsSync(srcPath: string, destDir: string): Promise<boolean> {
 		try {
 			const srcStat = await fs.stat(srcPath);
+			const adapter = this.plugin.app.vault.adapter;
 
 			// Check if dest directory exists
-			try {
-				await fs.access(destDir);
-			} catch {
-				return true; // Dir doesn't exist, need to sync
-			}
+			const dirExists = await adapter.exists(destDir);
+			if (!dirExists) return true;
 
-			// Look for any file derived from this source
-			// The JSONL filename is a UUID, and we create friendly-named copies.
-			// Check if any JSONL in destDir has same content by checking for
-			// a raw JSONL copy. We use a simple approach: check all .jsonl files in dest.
-			const destFiles = await fs.readdir(destDir);
-			const jsonlFiles = destFiles.filter(f => f.endsWith('.jsonl'));
+			// List files in dest and check JSONL mtimes
+			const listing = await adapter.list(destDir);
+			const jsonlFiles = listing.files.filter(f => f.endsWith('.jsonl'));
 
 			if (jsonlFiles.length === 0) return true;
 
-			// Check if source is newer than the newest dest JSONL
+			// Check if source is newer than any dest JSONL
 			for (const jf of jsonlFiles) {
-				const destStat = await fs.stat(path.join(destDir, jf));
-				if (destStat.mtimeMs >= srcStat.mtimeMs) return false;
+				const destStat = await adapter.stat(jf);
+				if (destStat && destStat.mtime >= srcStat.mtimeMs) return false;
 			}
 
 			return true;
 		} catch {
 			return true;
+		}
+	}
+
+	/**
+	 * Ensure a directory exists in the vault, creating it recursively if needed.
+	 */
+	private async ensureVaultDir(vaultPath: string): Promise<void> {
+		const adapter = this.plugin.app.vault.adapter;
+		const exists = await adapter.exists(vaultPath);
+		if (exists) return;
+
+		// Create parent directories recursively
+		const parts = vaultPath.split('/');
+		let current = '';
+		for (const part of parts) {
+			current = current ? `${current}/${part}` : part;
+			const partExists = await adapter.exists(current);
+			if (!partExists) {
+				await adapter.mkdir(normalizePath(current));
+			}
 		}
 	}
 
@@ -360,8 +365,8 @@ export class ContextSyncer {
 			if (!line.trim()) continue;
 			try {
 				entries.push(JSON.parse(line) as ConversationEntry);
-			} catch {
-				// Skip unparseable lines
+			} catch (e) {
+				console.warn(`Claude Context Syncer: Skipping malformed JSONL line in ${path.basename(filePath)}`);
 			}
 		}
 
@@ -384,9 +389,5 @@ export class ContextSyncer {
 		} catch {
 			return [];
 		}
-	}
-
-	private getVaultBasePath(): string {
-		return (this.plugin.app.vault.adapter as any).basePath;
 	}
 }
