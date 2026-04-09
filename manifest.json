@@ -1,7 +1,7 @@
 {
 	"id": "claude-context-syncer",
 	"name": "Claude Context Syncer",
-	"version": "1.0.2",
+	"version": "1.0.4",
 	"minAppVersion": "0.15.0",
 	"description": "Sync Claude Code contexts (~/.claude/) into your vault with readable Markdown conversions.",
 	"author": "Telep IO LLC",

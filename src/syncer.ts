@@ -27,7 +27,7 @@ export class ContextSyncer {
 		try {
 			await fs.access(claudeHome);
 		} catch {
-			new Notice('Claude Context Syncer: ~/.claude not found');
+			new Notice('Claude context syncer: ~/.claude not found');
 			console.warn('Claude Context Syncer: ~/.claude does not exist');
 			return;
 		}
@@ -37,7 +37,7 @@ export class ContextSyncer {
 		}
 
 		if (this.plugin.settings.syncOnStartup) {
-			setTimeout(() => this.syncAll(), 1000);
+			setTimeout(() => void this.syncAll(), 1000);
 		}
 	}
 
@@ -78,10 +78,11 @@ export class ContextSyncer {
 				console.error('Claude Context Syncer: Watcher error', error);
 				if (this.restartingWatcher) return;
 				this.restartingWatcher = true;
-				setTimeout(async () => {
-					await this.stopWatching();
-					await this.startWatching();
-					this.restartingWatcher = false;
+				setTimeout(() => {
+					this.stopWatching()
+						.then(() => this.startWatching())
+						.then(() => { this.restartingWatcher = false; })
+						.catch((err: unknown) => { console.error('Claude Context Syncer: Restart failed', err); });
 				}, 5000);
 			});
 	}
@@ -103,7 +104,7 @@ export class ContextSyncer {
 
 		const timeout = setTimeout(() => {
 			this.pendingSyncs.delete(filePath);
-			this.syncFile(filePath);
+			void this.syncFile(filePath);
 		}, 1000);
 
 		this.pendingSyncs.set(filePath, timeout);
@@ -250,7 +251,7 @@ export class ContextSyncer {
 			this.plugin.settings.lastSyncTime = Date.now();
 
 			return { success: true, project: projectName, file: mdFileName, action: 'updated' };
-		} catch (error: any) {
+		} catch (error: unknown) {
 			return { success: false, project: '', file: path.basename(filePath), action: 'error', error: getErrorMessage(error) };
 		} finally {
 			this.syncInProgress.delete(filePath);
@@ -365,8 +366,8 @@ export class ContextSyncer {
 			if (!line.trim()) continue;
 			try {
 				entries.push(JSON.parse(line) as ConversationEntry);
-			} catch (e) {
-				console.warn(`Claude Context Syncer: Skipping malformed JSONL line in ${path.basename(filePath)}`);
+			} catch (error) {
+				console.warn(`Claude Context Syncer: Skipping malformed JSONL line in ${path.basename(filePath)}`, error);
 			}
 		}
 

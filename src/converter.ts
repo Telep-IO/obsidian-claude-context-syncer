@@ -172,7 +172,7 @@ function renderAssistantEntry(entry: ConversationEntry): string | null {
 
 	const parts: string[] = [];
 
-	for (const block of content as ContentBlock[]) {
+	for (const block of content) {
 		switch (block.type) {
 			case 'text':
 				if (block.text) parts.push(block.text);
@@ -195,23 +195,25 @@ function renderAssistantEntry(entry: ConversationEntry): string | null {
 function renderToolUse(block: ContentBlock): string {
 	const name = block.name || 'Unknown';
 	const input = block.input || {};
+	const str = (key: string): string =>
+		typeof input[key] === 'string' ? input[key] : '';
 
 	// Create a brief summary of what the tool does
 	let summary = '';
 	if (input.command) {
-		summary = `\`${truncate(input.command, 100)}\``;
+		summary = `\`${truncate(str('command'), 100)}\``;
 	} else if (input.file_path) {
-		summary = `\`${input.file_path}\``;
+		summary = `\`${str('file_path')}\``;
 	} else if (input.pattern) {
-		summary = `\`${input.pattern}\``;
+		summary = `\`${str('pattern')}\``;
 	} else if (input.query) {
-		summary = `\`${truncate(input.query, 100)}\``;
+		summary = `\`${truncate(str('query'), 100)}\``;
 	} else if (input.prompt) {
-		summary = `\`${truncate(input.prompt, 100)}\``;
+		summary = `\`${truncate(str('prompt'), 100)}\``;
 	} else if (input.content) {
-		summary = `${truncate(String(input.content), 80)}`;
+		summary = `${truncate(str('content'), 80)}`;
 	} else if (input.old_string) {
-		summary = `edit in \`${input.file_path || 'file'}\``;
+		summary = `edit in \`${str('file_path') || 'file'}\``;
 	}
 
 	if (summary) {

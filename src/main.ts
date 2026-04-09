@@ -18,13 +18,13 @@ export default class ClaudeContextSyncPlugin extends Plugin {
 
 		this.addCommand({
 			id: 'sync-claude-contexts',
-			name: 'Sync Claude contexts now',
+			name: 'Sync claude contexts now',
 			callback: async () => {
 				if (!this.syncer) {
 					new Notice('Claude syncer not initialized');
 					return;
 				}
-				new Notice('Syncing Claude contexts...');
+				new Notice('Syncing claude contexts...');
 				const results = await this.syncer.syncAll();
 				const successCount = results.filter(r => r.success).length;
 				new Notice(`Synced ${successCount} conversation(s)`);
@@ -34,9 +34,9 @@ export default class ClaudeContextSyncPlugin extends Plugin {
 		await this.initializeSyncer();
 	}
 
-	async onunload() {
+	onunload() {
 		if (this.syncer) {
-			await this.syncer.stopWatching();
+			void this.syncer.stopWatching();
 		}
 	}
 
@@ -68,14 +68,14 @@ export default class ClaudeContextSyncPlugin extends Plugin {
 		}
 
 		if (this.settings.lastSyncTime === 0) {
-			this.statusBarItem.setText('Claude: Ready');
+			this.statusBarItem.setText('Claude: ready');
 		} else {
 			this.statusBarItem.setText(`Claude: ${formatRelativeTime(this.settings.lastSyncTime)}`);
 		}
 	}
 
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<SyncerSettings>);
 	}
 
 	async saveSettings() {

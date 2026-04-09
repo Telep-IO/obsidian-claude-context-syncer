@@ -17,7 +17,7 @@ export interface ContentBlock {
 	text?: string;
 	thinking?: string;
 	name?: string;
-	input?: any;
+	input?: Record<string, unknown>;
 	id?: string;
 	signature?: string;
 }
@@ -39,7 +39,7 @@ export interface ConversationEntry {
 	parentUuid?: string | null;
 	slug?: string;
 	planContent?: string;
-	[key: string]: any;
+	[key: string]: unknown;
 }
 
 export interface SyncResult {

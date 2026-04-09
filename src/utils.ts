@@ -19,17 +19,22 @@ export function formatRelativeTime(timestamp: number): string {
 	return `${days}d ago`;
 }
 
-export function getErrorMessage(error: any): string {
+export function getErrorMessage(error: unknown): string {
 	if (!error) return 'Unknown error';
-	if (error.code) {
-		switch (error.code) {
-			case 'EACCES': return 'Permission denied';
-			case 'ENOENT': return 'File or directory not found';
-			case 'ENOSPC': return 'Disk full';
-			default: return `File system error: ${error.code}`;
+	if (error instanceof Error) {
+		const nodeError = error as NodeJS.ErrnoException;
+		if (nodeError.code) {
+			switch (nodeError.code) {
+				case 'EACCES': return 'Permission denied';
+				case 'ENOENT': return 'File or directory not found';
+				case 'ENOSPC': return 'Disk full';
+				default: return `File system error: ${nodeError.code}`;
+			}
 		}
+		return error.message;
 	}
-	return error.message || error.toString();
+	if (typeof error === 'string') return error;
+	return 'Unknown error';
 }
 
 export function sanitizeFileName(name: string): string {

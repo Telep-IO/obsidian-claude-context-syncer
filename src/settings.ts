@@ -16,7 +16,7 @@ export class ClaudeContextSyncSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('Vault folder')
-			.setDesc('Folder within your vault where Claude data will be synced')
+			.setDesc('Folder within your vault where claude data will be synced')
 			.addText(text => text
 				.setPlaceholder('Claude')
 				.setValue(this.plugin.settings.vaultFolder)
@@ -27,7 +27,7 @@ export class ClaudeContextSyncSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('Auto-sync')
-			.setDesc('Automatically sync when Claude Code creates or modifies files')
+			.setDesc('Automatically sync when claude code creates or modifies files')
 			.addToggle(toggle => toggle
 				.setValue(this.plugin.settings.autoSync)
 				.onChange(async (value) => {
@@ -53,9 +53,9 @@ export class ClaudeContextSyncSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('Sync now')
-			.setDesc('Manually sync all Claude contexts')
+			.setDesc('Manually sync all claude contexts')
 			.addButton(button => button
-				.setButtonText('Sync Now')
+				.setButtonText('Sync now')
 				.setCta()
 				.onClick(async () => {
 					if (!this.plugin.syncer) {
@@ -76,11 +76,11 @@ export class ClaudeContextSyncSettingTab extends PluginSettingTab {
 						} else {
 							new Notice(`Synced ${successCount}, ${errorCount} error(s)`);
 						}
-					} catch (error: any) {
+					} catch (error: unknown) {
 						new Notice(`Sync failed: ${getErrorMessage(error)}`);
 					} finally {
 						button.setDisabled(false);
-						button.setButtonText('Sync Now');
+						button.setButtonText('Sync now');
 						this.display(); // Refresh to update last sync time
 					}
 				}));
